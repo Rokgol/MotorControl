@@ -315,17 +315,33 @@ static float controller_update(float measured_velocity, uint32_t current_ticks)
      */
     c = fmaxf(
         -CONTROL_LIMIT,
-        fminf(CONTROL_LIMIT, c));
+        fminf(CONTROL_LIMIT, c)
+    );
 
-    /*
-     * Requested direction
-     */
+
     int requested_direction = 0;
 
     if (c > 0.0f)
         requested_direction = +1;
     else if (c < 0.0f)
         requested_direction = -1;
+
+        
+    // Hard Brake condition
+    if (fabsf(c) >= CONTROL_LIMIT / 2.0f && fsgnf(c) != fsgnf(c_previous))
+    {
+        gpio_put(MOTOR_DIR_PIN0, 1);
+        gpio_put(MOTOR_DIR_PIN1, 1);
+        c_previous = c;
+        modus = MODUS_BRAKE;
+        return c;
+    }
+
+    /*
+     * Requested direction
+     */
+    
+    
 
     /*
      * --------------------------------------------------------
