@@ -1,0 +1,53 @@
+.program encoder_period
+
+; Measures total PIO clock cycles between consecutive rising edges on the encoder pin.
+; Pin must be assigned to both IN and JMP pin configurations.
+
+.wrap_target
+    WAIT 0 PIN 0        ; Wait for pin to be LOW (0) to ensure a clean starting state
+    WAIT 1 PIN 0        ; Wait for Rising Edge (0 -> 1)
+    MOV X, ~NULL        ; Pre-load counter X with 0xFFFFFFFF
+
+high_loop:
+    JMP PIN, high_cont  ; 1 cycle: Check if pin is still HIGH (1)
+    JMP low_loop        ; 1 cycle: Pin went LOW -> transition to low phase
+high_cont:
+    JMP X-- high_loop   ; 1 cycle: Decrement X counter and repeat (2 cycles total per iteration)
+
+low_loop:
+    JMP PIN, period_done ; 1 cycle: Pin went HIGH -> Next rising edge detected!
+    JMP X-- low_loop    ; 1 cycle: Decrement X counter and repeat (2 cycles total per iteration)
+
+period_done:
+    MOV ISR, ~X         ; Invert X to get elapsed count (0xFFFFFFFF - X)
+    PUSH NOBLOCK        ; Push total iterations count to RX FIFO
+.wrap
+
+
+% c-sdk {
+#include "hardware/clocks.h"
+#include "hardware/gpio.h"
+
+static inline void encoder_period_program_init(PIO pio, uint sm, uint offset, uint pin) {
+    pio_sm_config c = encoder_period_program_get_default_config(offset);
+
+    // Set pin direction as input
+    pio_gpio_init(pio, pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, false);
+    gpio_pull_up(pin);
+
+    // Map pin to IN and JMP controls
+    sm_config_set_in_pins(&c, pin);
+    sm_config_set_jmp_pin(&c, pin);
+
+    // Shift left, disable autopush
+    sm_config_set_in_shift(&c, false, false, 32);
+
+    // Configure state machine clock to 1 MHz (1 cycle = 1 us, 1 decrement loop = 2 us)
+    float clkdiv = (float)clock_get_hz(clk_sys) / 1000000.0f;
+    sm_config_set_clkdiv(&c, clkdiv);
+
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}

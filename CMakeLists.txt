@@ -57,6 +57,10 @@ target_include_directories(MotorControl PRIVATE
 target_link_libraries(MotorControl 
         hardware_pwm
         hardware_adc
+        pico/cyw43_arch_none
+        hardware_timer
+        hardware_pio
+        pico_cyw43_arch_none
         )
 
 pico_add_extra_outputs(MotorControl)

@@ -7,6 +7,8 @@
 #include "hardware/pwm.h"
 #include "hardware/adc.h"
 #include "hardware/timer.h"
+#include "hardware/pio.h"
+#include "pico/cyw43_arch.h"
 
 // ============================================================
 // MODUS ENUMERATION
@@ -33,9 +35,15 @@ typedef enum {
 // Simulated encoder / velocity output
 #define SENSOR_PWM_PIN      1
 
+// Real Physical Optical Encoder Input Pin
+#define ENCODER_PIN         18
+
 // ADC input for simulated sensor
 #define SENSOR_ADC_GPIO     26       // ADC0
 #define SENSOR_ADC_CHANNEL  0
+
+//STBY Pin
+#define MOTOR_STBY_PIN      16
 
 
 // ============================================================
@@ -60,12 +68,15 @@ typedef enum {
 // ============================================================
 
 #define MASS                1.0f
+#define MASS                0.4f
 #define WHEEL_RADIUS        0.025f
 
 #define ENCODER_MARKS       24
+#define ENCODER_MARKS       20
 
 #define MU0                 0.89f
 #define TAU0                3.0f
+#define TAU0                8e-3f
 
 #define MU_TIRE             0.89f
 #define G                   9.81f
@@ -112,6 +123,47 @@ static float c_previous = 0.0f;
 
 static int motor_direction = 0;
 static uint32_t brake_until_ticks = 0;
+
+// ============================================================
+// PIO ENCODER READER
+// ============================================================
+
+static PIO encoder_pio = pio0;
+static uint encoder_sm = 0;
+
+static float read_pio_encoder_velocity(uint32_t current_ticks) {
+    static float last_measured_speed = 0.0f;
+    static uint32_t last_pulse_ticks = 0;
+    
+    bool new_pulse = false;
+    uint32_t pulse_iterations = 0;
+
+    // Drain FIFO to get the latest period measurement
+    while (!pio_sm_is_rx_fifo_empty(encoder_pio, encoder_sm)) {
+        pulse_iterations = pio_sm_get(encoder_pio, encoder_sm);
+        new_pulse = true;
+    }
+
+    if (new_pulse && pulse_iterations > 0) {
+        // PIO SM clock runs at 1 MHz (1 us/cycle)
+        // Each loop iteration takes 2 PIO clock cycles (2 us)
+        float delta_t = (float)(pulse_iterations * 2) * 1e-6f;
+
+        if (delta_t > 0.0f) {
+            last_measured_speed = DX_MARK / delta_t;
+            last_pulse_ticks = current_ticks;
+        }
+    }
+
+    // Timeout check: If no pulse arrived in 0.20s (2000 ticks), wheel is stationary
+    if ((current_ticks - last_pulse_ticks) > 2000U) {
+        last_measured_speed = 0.0f;
+    }
+
+    // Apply directional sign from motor state (Photo-interrupters only measure speed magnitude)
+    float direction_sign = (motor_direction != 0) ? (float)motor_direction : 1.0f;
+    return last_measured_speed * direction_sign;
+}
 
 
 // ============================================================
@@ -329,6 +381,7 @@ static float controller_update(float measured_velocity, uint32_t current_ticks)
         
     // Hard Brake condition
     if (fabsf(c) >= CONTROL_LIMIT / 2.0f && fsgnf(c) != fsgnf(c_previous))
+    if (fabsf(c) >= CONTROL_LIMIT / 2.0f && copysignf(1.0f, c) != copysignf(1.0f, c_previous))
     {
         gpio_put(MOTOR_DIR_PIN0, 1);
         gpio_put(MOTOR_DIR_PIN1, 1);
@@ -406,6 +459,9 @@ static void hardware_init(void)
 {
     stdio_init_all();
 
+    cyw43_arch_init();
+    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
+
     setup_pwm(MOTOR_PWM_PIN);
     setup_pwm(SENSOR_PWM_PIN);
 
@@ -414,6 +470,10 @@ static void hardware_init(void)
 
     gpio_init(MOTOR_DIR_PIN1);
     gpio_set_dir(MOTOR_DIR_PIN1, GPIO_OUT);
+
+    gpio_init(MOTOR_STBY_PIN);
+    gpio_set_dir(MOTOR_STBY_PIN, GPIO_OUT);
+    gpio_put(MOTOR_STBY_PIN, 1);
 
     adc_init();
     adc_gpio_init(SENSOR_ADC_GPIO);
@@ -430,7 +490,6 @@ static void hardware_init(void)
 int main(void)
 {
     hardware_init();
-
     printf("\n");
     printf("=====================================\n");
     printf(" Pico Closed-Loop Controller (RP2350 Optimized)\n");
@@ -445,15 +504,21 @@ int main(void)
     uint32_t sample_ticks = 0;
     absolute_time_t next_sample = make_timeout_time_us(TS_US);
 
+    gpio_put(MOTOR_STBY_PIN, 1);
+    
     sleep_ms(10000);
 
     while (true)
     {
+        gpio_put(MOTOR_STBY_PIN, 1);
         sample_ticks++;
 
         /*
          * 1. SIMULATED PLANT
          */
+        
+         // 1. SIMULATED PLANT
+         
         update_plant(c_previous);
 
         /*
@@ -471,10 +536,26 @@ int main(void)
          * 4. CONTROLLER (Tick-Based Deadtime)
          */
         float c = controller_update(encoder_velocity, sample_ticks);
+        // 2. Read Velocity directly from PIO hardware queue
 
         /*
          * 5. MOTOR PWM
          */
+        float measured_v = read_pio_encoder_velocity(sample_ticks);
+
+        
+         // 3.  SENSOR OUTPUT
+         
+        //output_simulated_sensor(encoder_velocity);
+
+        
+         // 4. CONTROLLER (Tick-Based Deadtime)
+         
+        float c = controller_update(measured_v, sample_ticks);
+
+        
+         // 5. MOTOR PWM
+         
         float duty = fabsf(c);
         
 
@@ -495,6 +576,7 @@ int main(void)
                 "ticks=%u\n",
                 velocity,
                 encoder_velocity,
+                measured_v,
                 c,
                 (int)modus,
                 sample_ticks
@@ -504,6 +586,9 @@ int main(void)
         /*
          * 6. WAIT FOR NEXT CONTROL SAMPLE (100 us = 10 kHz)
          */
+        
+         //6. WAIT FOR NEXT CONTROL SAMPLE (100 us = 10 kHz)
+         
         if (modus == MODUS_BRAKE)
         {
             next_sample = delayed_by_us(next_sample, 25U);
