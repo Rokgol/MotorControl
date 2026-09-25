@@ -33,35 +33,32 @@ project(MotorControl C CXX ASM)
 # Initialise the Raspberry Pi Pico SDK
 pico_sdk_init()
 
-# Add executable. Default name is the project name, version 0.1
+# Add executable
+add_executable(MotorControl MotorControl.c)
 
-add_executable(MotorControl MotorControl.c )
+# Generate PIO header targeting MotorControl
+pico_generate_pio_header(MotorControl ${CMAKE_CURRENT_LIST_DIR}/encoder_period.pio)
 
 pico_set_program_name(MotorControl "MotorControl")
 pico_set_program_version(MotorControl "0.1")
 
-# Modify the below lines to enable/disable output over UART/USB
+# Enable USB output
 pico_enable_stdio_uart(MotorControl 0)
 pico_enable_stdio_usb(MotorControl 1)
 
-# Add the standard library to the build
-target_link_libraries(MotorControl
-        pico_stdlib)
-
-# Add the standard include files to the build
+# Add include directories
 target_include_directories(MotorControl PRIVATE
-        ${CMAKE_CURRENT_LIST_DIR}
+    ${CMAKE_CURRENT_LIST_DIR}
 )
 
-# Add any user requested libraries
-target_link_libraries(MotorControl 
-        hardware_pwm
-        hardware_adc
-        pico/cyw43_arch_none
-        hardware_timer
-        hardware_pio
-        pico_cyw43_arch_none
-        )
+# Link required libraries
+target_link_libraries(MotorControl
+    pico_stdlib
+    hardware_pio
+    hardware_pwm
+    hardware_adc
+    hardware_timer
+    pico_cyw43_arch_none
+)
 
 pico_add_extra_outputs(MotorControl)
-

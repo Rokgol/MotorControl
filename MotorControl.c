@@ -9,6 +9,7 @@
 #include "hardware/timer.h"
 #include "hardware/pio.h"
 #include "pico/cyw43_arch.h"
+#include "encoder_period.pio.h"
 
 // ============================================================
 // MODUS ENUMERATION
@@ -67,15 +68,12 @@ typedef enum {
 // VEHICLE / ENCODER MODEL
 // ============================================================
 
-#define MASS                1.0f
 #define MASS                0.4f
-#define WHEEL_RADIUS        0.025f
+#define WHEEL_RADIUS        0.03f
 
-#define ENCODER_MARKS       24
 #define ENCODER_MARKS       20
 
 #define MU0                 0.89f
-#define TAU0                3.0f
 #define TAU0                8e-3f
 
 #define MU_TIRE             0.89f
@@ -128,13 +126,12 @@ static uint32_t brake_until_ticks = 0;
 // PIO ENCODER READER
 // ============================================================
 
-static PIO encoder_pio = pio0;
-static uint encoder_sm = 0;
+static PIO encoder_pio = pio1;
+static int encoder_sm = -1;
+static float last_measured_speed = 0.0f;
+static uint32_t last_pulse_ticks = 0;
 
 static float read_pio_encoder_velocity(uint32_t current_ticks) {
-    static float last_measured_speed = 0.0f;
-    static uint32_t last_pulse_ticks = 0;
-    
     bool new_pulse = false;
     uint32_t pulse_iterations = 0;
 
@@ -148,6 +145,8 @@ static float read_pio_encoder_velocity(uint32_t current_ticks) {
         // PIO SM clock runs at 1 MHz (1 us/cycle)
         // Each loop iteration takes 2 PIO clock cycles (2 us)
         float delta_t = (float)(pulse_iterations * 2) * 1e-6f;
+        printf("delta_t: %.6f s, pulse_iterations: %u, current_ticks: %u\n", delta_t, pulse_iterations, current_ticks);
+        sleep_ms(1000); // Optional: Add a small delay for debugging purposes
 
         if (delta_t > 0.0f) {
             last_measured_speed = DX_MARK / delta_t;
@@ -156,8 +155,9 @@ static float read_pio_encoder_velocity(uint32_t current_ticks) {
     }
 
     // Timeout check: If no pulse arrived in 0.20s (2000 ticks), wheel is stationary
-    if ((current_ticks - last_pulse_ticks) > 2000U) {
+    else if ((current_ticks - last_pulse_ticks) > 20000U) {
         last_measured_speed = 0.0f;
+        printf("No pulse detected for 0.20s, setting speed to 0.0 m/s\n");
     }
 
     // Apply directional sign from motor state (Photo-interrupters only measure speed magnitude)
@@ -352,15 +352,12 @@ static float controller_update(float measured_velocity, uint32_t current_ticks)
     /*
      * Error
      */
-    float e =
-        V_REF - measured_velocity;
+    float e = V_REF - measured_velocity;
 
     /*
      * C(z): c[k] = KP * e[k] + ALPHA * c[k-1]
      */
-    float c =
-        KP * e +
-        ALPHA * c_previous;
+    float c = KP * e + ALPHA * c_previous;
 
     /*
      * Saturation
@@ -380,7 +377,6 @@ static float controller_update(float measured_velocity, uint32_t current_ticks)
 
         
     // Hard Brake condition
-    if (fabsf(c) >= CONTROL_LIMIT / 2.0f && fsgnf(c) != fsgnf(c_previous))
     if (fabsf(c) >= CONTROL_LIMIT / 2.0f && copysignf(1.0f, c) != copysignf(1.0f, c_previous))
     {
         gpio_put(MOTOR_DIR_PIN0, 1);
@@ -479,6 +475,12 @@ static void hardware_init(void)
     adc_gpio_init(SENSOR_ADC_GPIO);
     adc_select_input(SENSOR_ADC_CHANNEL);
 
+    encoder_sm = pio_claim_unused_sm(encoder_pio, true);
+    uint offset = pio_add_program(encoder_pio, &encoder_period_program);
+    encoder_period_program_init(encoder_pio, encoder_sm, offset, ENCODER_PIN);
+
+    motor_direction = copysignf(1.0f, V_REF);
+
     next_mark_position = DX_MARK;
 }
 
@@ -490,8 +492,7 @@ static void hardware_init(void)
 int main(void)
 {
     hardware_init();
-    printf("\n");
-    printf("=====================================\n");
+    printf("\n=====================================\n");
     printf(" Pico Closed-Loop Controller (RP2350 Optimized)\n");
     printf("=====================================\n");
     printf("Ts             = %.6f s\n", TS);
@@ -501,71 +502,33 @@ int main(void)
     printf("Deadtime Ticks = %u (%u us)\n", REVERSE_DEAD_TIME_TICKS, REVERSE_DEAD_TIME_TICKS * TS_US);
     printf("\n");
 
+    // 10-second startup delay before starting control loop
+    //sleep_ms(1000);
+
     uint32_t sample_ticks = 0;
     absolute_time_t next_sample = make_timeout_time_us(TS_US);
-
-    gpio_put(MOTOR_STBY_PIN, 1);
-    
-    sleep_ms(10000);
 
     while (true)
     {
         gpio_put(MOTOR_STBY_PIN, 1);
         sample_ticks++;
 
-        /*
-         * 1. SIMULATED PLANT
-         */
-        
-         // 1. SIMULATED PLANT
-         
+        // 1. Plant Simulation
         update_plant(c_previous);
 
-        /*
-         * 2. SIMULATED ENCODER
-         */
-        float current_time = (float)sample_ticks * TS;
-        simulate_encoder(current_time);
-
-        /*
-         * 3. SIMULATED SENSOR OUTPUT
-         */
-        output_simulated_sensor(encoder_velocity);
-
-        /*
-         * 4. CONTROLLER (Tick-Based Deadtime)
-         */
-        float c = controller_update(encoder_velocity, sample_ticks);
         // 2. Read Velocity directly from PIO hardware queue
-
-        /*
-         * 5. MOTOR PWM
-         */
         float measured_v = read_pio_encoder_velocity(sample_ticks);
 
-        
-         // 3.  SENSOR OUTPUT
-         
-        //output_simulated_sensor(encoder_velocity);
-
-        
-         // 4. CONTROLLER (Tick-Based Deadtime)
-         
+        // 3. Controller Update
         float c = controller_update(measured_v, sample_ticks);
 
-        
-         // 5. MOTOR PWM
-         
+        // 4. Drive Motor PWM
         float duty = fabsf(c);
-        
-
         set_pwm_duty(MOTOR_PWM_PIN, duty);
 
-        /*
-         * Debug Output
-         */
+        // 5. Debug Output (Every 50 ms)
         static uint32_t counter = 0;
-        //if (++counter >= 500)
+        if (++counter >= 500)
         {
             counter = 0;
             printf(
@@ -575,7 +538,6 @@ int main(void)
                 "mode=%d  "
                 "ticks=%u\n",
                 velocity,
-                encoder_velocity,
                 measured_v,
                 c,
                 (int)modus,
@@ -583,12 +545,7 @@ int main(void)
             );
         }
 
-        /*
-         * 6. WAIT FOR NEXT CONTROL SAMPLE (100 us = 10 kHz)
-         */
-        
-         //6. WAIT FOR NEXT CONTROL SAMPLE (100 us = 10 kHz)
-         
+        // 6. Sample timing management (100 us tick)
         if (modus == MODUS_BRAKE)
         {
             next_sample = delayed_by_us(next_sample, 25U);
