@@ -59,6 +59,7 @@ target_link_libraries(MotorControl
     hardware_adc
     hardware_timer
     pico_cyw43_arch_none
+    pico_low_power
 )
 
 pico_add_extra_outputs(MotorControl)
