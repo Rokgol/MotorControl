@@ -34,7 +34,10 @@ project(MotorControl C CXX ASM)
 pico_sdk_init()
 
 # Add executable
-add_executable(MotorControl MotorControl.c)
+add_executable(MotorControl 
+    main_ap.c
+    motor_control.c
+)
 
 # Generate PIO header targeting MotorControl
 pico_generate_pio_header(MotorControl ${CMAKE_CURRENT_LIST_DIR}/encoder_period.pio)
@@ -58,7 +61,7 @@ target_link_libraries(MotorControl
     hardware_pwm
     hardware_adc
     hardware_timer
-    pico_cyw43_arch_none
+    pico_cyw43_arch_lwip_threadsafe_background
     pico_low_power
 )
 
