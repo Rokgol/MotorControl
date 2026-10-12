@@ -28,14 +28,15 @@ typedef enum {
 // PINS
 // ============================================================
 
-// Actual motor-control PWM
-#define MOTOR_PWM_PIN       15
+// Actual motor-control PWMs
+#define MOTOR_L_PWM_PIN     15
+#define MOTOR_R_PWM_PIN     17
 
 // Direction pins for Driver IC (H-bridge)
-#define MOTOR_DIR_PIN0      13
-#define MOTOR_DIR_PIN1      14
-#define MOTOR_DIR_PIN2      11
-#define MOTOR_DIR_PIN3      12
+#define MOTOR_L_DIR_PIN0    13
+#define MOTOR_L_DIR_PIN1    14
+#define MOTOR_R_DIR_PIN0    11
+#define MOTOR_R_DIR_PIN1    12
 
 
 // Simulated encoder / velocity output
@@ -59,12 +60,12 @@ typedef enum {
 #define TS                  0.0001f   // 100 us sample period = 10 kHz
 #define TS_US               100U      // 100 us in discrete integer microseconds
 
-#define V_REF               3.0f      // desired velocity [m/s]
-
 #define KP                  1.0f
-#define ALPHA               0.0625f
+#define ALPHA               0.625f
 
 #define CONTROL_LIMIT       1.0f
+#define V_MAX               0.663f  // Maximum velocity per direction. 
+                                    // Maximum abs velocity: 0.44 ~ (0.663)^2
 
 #define REVERSE_DEAD_TIME_TICKS 100U   // 5 ms deadtime = 50 ticks of 100 us
 
@@ -88,10 +89,20 @@ typedef enum {
 #define RHO                 1.225f
 #define CDA                 0.03f
 
+//===============================================
+//v_ref directions (should be inputted from pico)
+//===============================================
+// Velocity reference vectors (can be updated via remote control)
+static float v_ref_x = 0.0f;
+static float v_ref_y = 0.44; //Total Velocity Should be kept under 0.44
+static float v_ref_abs = 0.0f;
+static float v_ref_angle = 0.0f;
+
+
+
 
 // Distance between encoder marks (single precision)
-static const float DX_MARK =
-    2.0f * (float)M_PI * WHEEL_RADIUS / (float)ENCODER_MARKS;
+static const float DX_MARK = 2.0f * (float)M_PI * WHEEL_RADIUS / (float)ENCODER_MARKS;
 
 // Maximum tire force
 static const float F_MAX =
@@ -125,7 +136,9 @@ static float encoder_velocity = 0.0f;
 static float c_previous = 0.0f;
 
 static int motor_direction = 0;
+static int last_active_direction = 1;
 static uint32_t brake_until_ticks = 0;
+static float integral_Controller = 0.0f;
 
 // ============================================================
 // PIO ENCODER READER
@@ -150,9 +163,6 @@ static float read_pio_encoder_velocity(uint32_t current_ticks) {
         // PIO SM clock runs at 1 MHz (1 us/cycle)
         // Each loop iteration takes 2 PIO clock cycles (2 us)
         float delta_t = (float)(pulse_iterations * 2) * 1e-6f;
-        //printf("delta_t: %.6f s, pulse_iterations: %u, current_ticks: %u\n", delta_t, pulse_iterations, current_ticks);
-        //sleep_ms(1000); // Optional: Add a small delay for debugging purposes
-
         if (delta_t > 0.0f) {
             last_measured_speed = DX_MARK / delta_t;
             last_pulse_ticks = current_ticks;
@@ -162,31 +172,13 @@ static float read_pio_encoder_velocity(uint32_t current_ticks) {
     // Timeout check: If no pulse arrived in 0.20s (2000 ticks), wheel is stationary
     else if ((current_ticks - last_pulse_ticks) > 2000U) {
         last_measured_speed = 0.0f;
-        //printf("No pulse detected for 0.20s, pulse_iterations: %u, current_ticks: %u\n",  pulse_iterations, current_ticks);
     }
 
     // Apply directional sign from motor state (Photo-interrupters only measure speed magnitude)
     float direction_sign = (motor_direction != 0) ? (float)motor_direction : 1.0f;
+    
     return last_measured_speed * direction_sign;
 }
-
-
-// ============================================================
-// MOTOR MODEL
-// ============================================================
-
-static float motor_acceleration(float c)
-{
-    if (fabsf(c) < 1e-12f)
-        return 0.0f;
-
-    float magnitude =
-        (4.0f * MU0 / MASS) *
-        sqrtf(fabsf(c) * TAU0);
-
-    return copysignf(magnitude, c);
-}
-
 
 // ============================================================
 // PWM SETUP
@@ -228,153 +220,39 @@ static void set_pwm_duty(uint gpio, float duty)
     pwm_set_chan_level(slice, channel, level);
 }
 
-
-// ============================================================
-// SIMULATED SENSOR PWM
-//
-// Encode velocity into duty:
-//      0 m/s -> 0%
-//      5 m/s -> 100%
-// ============================================================
-
-#define SENSOR_MAX_VELOCITY 5.0f
-
-static void output_simulated_sensor(float v)
-{
-    float duty = v / SENSOR_MAX_VELOCITY;
-
-    duty = fmaxf(0.0f, fminf(1.0f, duty));
-
-    set_pwm_duty(SENSOR_PWM_PIN, duty);
-}
-
-
-// ============================================================
-// ADC READ
-// ============================================================
-
-/*
-static float read_sensor_velocity(void)
-{
-    adc_select_input(SENSOR_ADC_CHANNEL);
-
-    uint16_t raw = adc_read();
-
-    float voltage =
-        ((float)raw / 4095.0f) * 3.3f;
-
-    float duty =
-        voltage / 3.3f;
-
-    float v =
-        duty * SENSOR_MAX_VELOCITY;
-
-    return v;
-}
-*/
-
-// ============================================================
-// ENCODER SIMULATION
-// ============================================================
-/*
-static void simulate_encoder(float t)
-{
-    while (position >= next_mark_position)
-    {
-        if (previous_mark_time >= 0.0f)
-        {
-            float delta_t =
-                t - previous_mark_time;
-
-            if (delta_t > 0.0f)
-            {
-                encoder_velocity =
-                    DX_MARK / delta_t;
-            }
-        }
-
-        previous_mark_time = t;
-
-        next_mark_position += DX_MARK;
-    }
-}
-*/
-
-
-// ============================================================
-// PLANT UPDATE
-// ============================================================
-
-static void update_plant(float c)
-{
-    float a_drive =
-        motor_acceleration(c);
-
-    float F_drive =
-        MASS * a_drive;
-
-    if (F_drive > F_MAX)
-        F_drive = F_MAX;
-
-    if (F_drive < -F_MAX)
-        F_drive = -F_MAX;
-
-    float F_roll = 0.0f;
-
-    if (fabsf(velocity) > 1e-10f)
-    {
-        F_roll =
-            CRR *
-            MASS *
-            G *
-            copysignf(1.0f, velocity);
-    }
-
-    float F_drag =
-        0.5f *
-        RHO *
-        CDA *
-        velocity *
-        fabsf(velocity);
-
-    float F_net =
-        F_drive -
-        F_roll -
-        F_drag;
-
-    acceleration =
-        F_net / MASS;
-
-    velocity += acceleration * TS;
-    position += velocity * TS;
-}
-
-
 // ============================================================
 // RP CONTROLLER (Optimized Tick-Based Deadtime)
 // ============================================================
-
-static float controller_update(float measured_velocity, uint32_t current_ticks)
+//How should we make controller updates per direction? 
+//We calculate the controller via the absolute velocity, 
+//then in main we will configure PWM'ing via sine and cosine to the absolute
+//of C.
+static float controller_update(float measured_velocity, float v_ref, uint32_t current_ticks)
 {
-    float e = V_REF - measured_velocity;
+    float e = v_ref - measured_velocity; //Error Signal
 
-    float c = KP * e + ALPHA * c_previous;  // C(z): c[k] = KP * e[k] + ALPHA * c[k-1]
+    integral_Controller += ALPHA * TS * e;
+    integral_Controller = fmaxf(-CONTROL_LIMIT, fminf(CONTROL_LIMIT, integral_Controller));
+    float c = KP * e + integral_Controller;  // C(z): c[k] = KP * e[k] + ALPHA * TS * c[k-1]
 
     c = fmaxf(-CONTROL_LIMIT, fminf(CONTROL_LIMIT, c)); // Saturation
 
     int requested_direction = 0;
 
-    if (c > 0.0f)
+    //deciding direction of wheel motion, forwards or backwards.
+    if (v_ref_y > 0.0f)
         requested_direction = +1;
-    else if (c < 0.0f)
+    else if (v_ref_y < 0.0f)
         requested_direction = -1;
 
+    // Should include a signal from system for hard brake condition, but for now just check if the sign of c has changed and the magnitude is above half the control limit.
+    // should be c_abs and a big enough c_angle (i.e change in direction).
     if (fabsf(c) >= CONTROL_LIMIT / 2.0f && copysignf(1.0f, c) != copysignf(1.0f, c_previous))  // Hard Brake condition
     {
-        gpio_put(MOTOR_DIR_PIN0, 1);
-        gpio_put(MOTOR_DIR_PIN1, 1);
-        gpio_put(MOTOR_DIR_PIN2, 1);
-        gpio_put(MOTOR_DIR_PIN3, 1);
+        gpio_put(MOTOR_L_DIR_PIN0, 1);
+        gpio_put(MOTOR_L_DIR_PIN1, 1);
+        gpio_put(MOTOR_R_DIR_PIN0, 1);
+        gpio_put(MOTOR_R_DIR_PIN1, 1);
 
         c_previous = c;
         modus = MODUS_BRAKE;
@@ -384,49 +262,59 @@ static float controller_update(float measured_velocity, uint32_t current_ticks)
      * --------------------------------------------------------
      * TICK-BASED REVERSE DEAD-TIME
      * --------------------------------------------------------
-     */
+     */ 
+
     if (current_ticks < brake_until_ticks)
     {
         c = 0.0f;
-    }
-    else if (requested_direction != 0 &&
-             motor_direction != 0 &&
-             requested_direction != motor_direction)
-    {
-        motor_direction = 0;
-        c = 0.0f;
-        brake_until_ticks = current_ticks + REVERSE_DEAD_TIME_TICKS;
+        motor_direction = 0; // ensure coasting during deadtime
     }
     else if (requested_direction != 0)
     {
-        motor_direction = requested_direction;
+        if (last_active_direction != 0 && requested_direction != last_active_direction)
+        {
+            // Direction reversal: trigger deadtime
+            motor_direction = 0;
+            c = 0.0f;
+            brake_until_ticks = current_ticks + REVERSE_DEAD_TIME_TICKS;
+            last_active_direction = requested_direction;
+        }
+        else
+        {
+            motor_direction = requested_direction;
+            last_active_direction = requested_direction;
+        }
+    }
+    else
+    {
+        motor_direction = 0; // coast
     }
 
     /*
      * Output direction state to Driver IC
      */
-    if (motor_direction > 0 && fabsf(c) > 1e-1f)
+    if (motor_direction > 0)
     {
-        gpio_put(MOTOR_DIR_PIN0, 1);
-        gpio_put(MOTOR_DIR_PIN1, 0);
-        gpio_put(MOTOR_DIR_PIN2, 1);
-        gpio_put(MOTOR_DIR_PIN3, 0);
+        gpio_put(MOTOR_L_DIR_PIN0, 1);
+        gpio_put(MOTOR_L_DIR_PIN1, 0);
+        gpio_put(MOTOR_R_DIR_PIN0, 1);
+        gpio_put(MOTOR_R_DIR_PIN1, 0);
         modus = MODUS_FORWARD;
     }
-    else if (motor_direction < 0 && fabsf(c) > 1e-1f)
+    else if (motor_direction < 0)
     {
-        gpio_put(MOTOR_DIR_PIN0, 0);
-        gpio_put(MOTOR_DIR_PIN1, 1);
-        gpio_put(MOTOR_DIR_PIN2, 0);
-        gpio_put(MOTOR_DIR_PIN3, 1);
+        gpio_put(MOTOR_L_DIR_PIN0, 0);
+        gpio_put(MOTOR_L_DIR_PIN1, 1);
+        gpio_put(MOTOR_R_DIR_PIN0, 0);
+        gpio_put(MOTOR_R_DIR_PIN1, 1);
         modus = MODUS_REVERSE;
     }
     else
     {
-        gpio_put(MOTOR_DIR_PIN0, 0);
-        gpio_put(MOTOR_DIR_PIN1, 0);
-        gpio_put(MOTOR_DIR_PIN2, 0);
-        gpio_put(MOTOR_DIR_PIN3, 0);
+        gpio_put(MOTOR_L_DIR_PIN0, 0);
+        gpio_put(MOTOR_L_DIR_PIN1, 0);
+        gpio_put(MOTOR_R_DIR_PIN0, 0);
+        gpio_put(MOTOR_R_DIR_PIN1, 0);
         modus = MODUS_COAST;
     }
 
@@ -442,7 +330,7 @@ static float controller_update(float measured_velocity, uint32_t current_ticks)
 // ============================================================
 // INITIALIZATION
 // ============================================================
-
+//should add additional PWM (one for left side, one for right side)
 static void hardware_init(void)
 {
     stdio_init_all();
@@ -450,20 +338,21 @@ static void hardware_init(void)
     cyw43_arch_init();
     cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
 
-    setup_pwm(MOTOR_PWM_PIN);
+    setup_pwm(MOTOR_L_PWM_PIN);
+    setup_pwm(MOTOR_R_PWM_PIN);
     setup_pwm(SENSOR_PWM_PIN);
 
-    gpio_init(MOTOR_DIR_PIN0);
-    gpio_set_dir(MOTOR_DIR_PIN0, GPIO_OUT);
+    gpio_init(MOTOR_L_DIR_PIN0);
+    gpio_set_dir(MOTOR_L_DIR_PIN0, GPIO_OUT);
 
-    gpio_init(MOTOR_DIR_PIN1);
-    gpio_set_dir(MOTOR_DIR_PIN1, GPIO_OUT);
+    gpio_init(MOTOR_L_DIR_PIN1);
+    gpio_set_dir(MOTOR_L_DIR_PIN1, GPIO_OUT);
 
-    gpio_init(MOTOR_DIR_PIN2);
-    gpio_set_dir(MOTOR_DIR_PIN2, GPIO_OUT);
+    gpio_init(MOTOR_R_DIR_PIN0);
+    gpio_set_dir(MOTOR_R_DIR_PIN0, GPIO_OUT);
 
-    gpio_init(MOTOR_DIR_PIN3);
-    gpio_set_dir(MOTOR_DIR_PIN3, GPIO_OUT);
+    gpio_init(MOTOR_R_DIR_PIN1);
+    gpio_set_dir(MOTOR_R_DIR_PIN1, GPIO_OUT);
 
     gpio_init(MOTOR_STBY_PIN);
     gpio_set_dir(MOTOR_STBY_PIN, GPIO_OUT);
@@ -477,7 +366,8 @@ static void hardware_init(void)
     uint offset = pio_add_program(encoder_pio, &encoder_period_program);
     encoder_period_program_init(encoder_pio, encoder_sm, offset, ENCODER_PIN);
 
-    motor_direction = copysignf(1.0f, V_REF);
+    motor_direction = copysignf(1.0f, v_ref_x);
+    last_active_direction = motor_direction;
 
     next_mark_position = DX_MARK;
 }
@@ -490,7 +380,8 @@ static void shutdown_pico(void)
 {
     // Optional: make the motor controller explicitly safe first.
     gpio_put(MOTOR_STBY_PIN, 0);
-    set_pwm_duty(MOTOR_PWM_PIN, 0.0f);
+    set_pwm_duty(MOTOR_L_PWM_PIN, 0.0f);
+    set_pwm_duty(MOTOR_R_PWM_PIN, 0.0f);
 
     // Enter the lowest-power RP2350 state.
     // at_the_end_of_time is ~300,000 years away.
@@ -519,15 +410,15 @@ static void shutdown_pico(void)
 int main(void)
 {
     hardware_init();
-    printf("\n=====================================\n");
-    printf(" Pico Closed-Loop Controller (RP2350 Optimized)\n");
-    printf("=====================================\n");
-    printf("Ts             = %.6f s\n", TS);
-    printf("Reference      = %.3f m/s\n", V_REF);
-    printf("Encoder marks  = %d\n", ENCODER_MARKS);
-    printf("DX mark        = %.6f m\n", DX_MARK);
-    printf("Deadtime Ticks = %u (%u us)\n", REVERSE_DEAD_TIME_TICKS, REVERSE_DEAD_TIME_TICKS * TS_US);
-    printf("\n");
+    v_ref_abs = sqrtf(v_ref_x * v_ref_x + v_ref_y * v_ref_y);
+    v_ref_angle = atan2f(v_ref_y, v_ref_x);
+    float v_target_left = v_ref_y + v_ref_x;
+    float v_target_right = v_ref_y - v_ref_x;
+    float measured_v = 0.0f;
+    float c_left = 0.0f;
+    float c_right = 0.0f;
+    float duty_R = 0.0f;
+    float duty_L = 0.0f;
 
     // 10-second startup delay before starting control loop
     //sleep_ms(1000);
@@ -536,48 +427,51 @@ int main(void)
     absolute_time_t next_sample = make_timeout_time_us(TS_US);
     static uint32_t counter = 0;
 
-    while (sample_ticks < 50000)  // Run for 5 seconds at 10 kHz
+    while (sample_ticks < 100000)  // Run for 10 seconds at 10 kHz
     {
         gpio_put(MOTOR_STBY_PIN, 1);
         sample_ticks++;
 
-        // 1. Plant Simulation
-        //update_plant(c_previous);
+        // 1. Update reference parameters (dynamically handle remote requests)
 
         // 2. Read Velocity directly from PIO hardware queue
-        float measured_v = read_pio_encoder_velocity(sample_ticks);
+        measured_v = read_pio_encoder_velocity(sample_ticks);
 
         // 3. Controller Update
-        float c = controller_update(measured_v, sample_ticks);
+        c_left = controller_update(measured_v, v_target_left, sample_ticks);
 
-        // 4. Drive Motor PWM
-        float duty = fabsf(c);
-        set_pwm_duty(MOTOR_PWM_PIN, duty);
+        // 4. Drive Motor PWM (Differential steering)
+        c_right = c_left;
 
-        // 5. Debug Output (Every 50 ms)
-        if (++counter >= 500)
+        if(v_ref_x > 0){
+            c_left = c_left;
+            c_right = c_right * (v_ref_x/v_ref_abs);
+        }
+        else if(v_ref_x < 0){
+            c_left = c_left;
+            c_right = c_right * fabsf(v_ref_abs/v_ref_x);
+        }
+        else{
+            duty_R = c_left;
+            duty_L = c_right;
+        }
+        duty_R = c_left;
+        duty_L = c_right;
+
+        set_pwm_duty(MOTOR_L_PWM_PIN, duty_L);
+        set_pwm_duty(MOTOR_R_PWM_PIN, duty_R);
+
+        // 5. Debug Output (Every 1s)
+        if (++counter >= 10000)
         {
             counter = 0;
             printf(
-                "v_true=%+.3f  "
                 "v_enc=%+.3f  "
-                "c=%+.3f  "
-                "mode=%d  "
-                "ticks=%u\n",
-                velocity,
+                "c=%+.3f  \n",
                 measured_v,
-                c,
-                (int)modus,
-                sample_ticks
+                c_left
             );
         }
-
-        // 6. Sample timing management (100 us tick)
-        if (modus == MODUS_BRAKE)
-        {
-            next_sample = delayed_by_us(next_sample, 25U);
-        }
-
         sleep_until(next_sample);
         next_sample = delayed_by_us(next_sample, TS_US);
     }

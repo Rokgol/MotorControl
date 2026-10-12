@@ -29,13 +29,14 @@ typedef enum {
 // ============================================================
 
 // Actual motor-control PWM
-#define MOTOR_PWM_PIN       15
+#define MOTOR_L_PWM_PIN     15
+#define MOTOR_R_PWM_PIN     17
 
 // Direction pins for Driver IC (H-bridge)
-#define MOTOR_DIR_PIN0      13
-#define MOTOR_DIR_PIN1      14
-#define MOTOR_DIR_PIN2      11
-#define MOTOR_DIR_PIN3      12
+#define MOTOR_R_DIR_PIN0      13
+#define MOTOR_R_DIR_PIN1      14
+#define MOTOR_L_DIR_PIN0      11
+#define MOTOR_L_DIR_PIN1      12
 
 
 // Simulated encoder / velocity output
@@ -235,10 +236,10 @@ static float controller_update(float measured_velocity, uint32_t current_ticks)
 
     if (fabsf(c) >= CONTROL_LIMIT / 2.0f && copysignf(1.0f, c) != copysignf(1.0f, c_previous))  // Hard Brake condition
     {
-        gpio_put(MOTOR_DIR_PIN0, 1);
-        gpio_put(MOTOR_DIR_PIN1, 1);
-        gpio_put(MOTOR_DIR_PIN2, 1);
-        gpio_put(MOTOR_DIR_PIN3, 1);
+        gpio_put(MOTOR_R_DIR_PIN0, 1);
+        gpio_put(MOTOR_R_DIR_PIN1, 1);
+        gpio_put(MOTOR_L_DIR_PIN0, 1);
+        gpio_put(MOTOR_L_DIR_PIN1, 1);
 
         c_previous = c;
         modus = MODUS_BRAKE;
@@ -271,26 +272,26 @@ static float controller_update(float measured_velocity, uint32_t current_ticks)
      */
     if (motor_direction > 0 && fabsf(c) > 1e-1f)
     {
-        gpio_put(MOTOR_DIR_PIN0, 1);
-        gpio_put(MOTOR_DIR_PIN1, 0);
-        gpio_put(MOTOR_DIR_PIN2, 1);
-        gpio_put(MOTOR_DIR_PIN3, 0);
+        gpio_put(MOTOR_R_DIR_PIN0, 1);
+        gpio_put(MOTOR_R_DIR_PIN1, 0);
+        gpio_put(MOTOR_L_DIR_PIN0, 1);
+        gpio_put(MOTOR_L_DIR_PIN1, 0);
         modus = MODUS_FORWARD;
     }
     else if (motor_direction < 0 && fabsf(c) > 1e-1f)
     {
-        gpio_put(MOTOR_DIR_PIN0, 0);
-        gpio_put(MOTOR_DIR_PIN1, 1);
-        gpio_put(MOTOR_DIR_PIN2, 0);
-        gpio_put(MOTOR_DIR_PIN3, 1);
+        gpio_put(MOTOR_R_DIR_PIN0, 0);
+        gpio_put(MOTOR_R_DIR_PIN1, 1);
+        gpio_put(MOTOR_L_DIR_PIN0, 0);
+        gpio_put(MOTOR_L_DIR_PIN1, 1);
         modus = MODUS_REVERSE;
     }
     else
     {
-        gpio_put(MOTOR_DIR_PIN0, 0);
-        gpio_put(MOTOR_DIR_PIN1, 0);
-        gpio_put(MOTOR_DIR_PIN2, 0);
-        gpio_put(MOTOR_DIR_PIN3, 0);
+        gpio_put(MOTOR_R_DIR_PIN0, 0);
+        gpio_put(MOTOR_R_DIR_PIN1, 0);
+        gpio_put(MOTOR_L_DIR_PIN0, 0);
+        gpio_put(MOTOR_L_DIR_PIN1, 0);
         modus = MODUS_COAST;
     }
 
@@ -307,44 +308,7 @@ static float controller_update(float measured_velocity, uint32_t current_ticks)
 // INITIALIZATION
 // ============================================================
 
-static void hardware_init(void)
-{
-    stdio_init_all();
 
-    cyw43_arch_init();
-    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
-
-    setup_pwm(MOTOR_PWM_PIN);
-    setup_pwm(SENSOR_PWM_PIN);
-
-    gpio_init(MOTOR_DIR_PIN0);
-    gpio_set_dir(MOTOR_DIR_PIN0, GPIO_OUT);
-
-    gpio_init(MOTOR_DIR_PIN1);
-    gpio_set_dir(MOTOR_DIR_PIN1, GPIO_OUT);
-
-    gpio_init(MOTOR_DIR_PIN2);
-    gpio_set_dir(MOTOR_DIR_PIN2, GPIO_OUT);
-
-    gpio_init(MOTOR_DIR_PIN3);
-    gpio_set_dir(MOTOR_DIR_PIN3, GPIO_OUT);
-
-    gpio_init(MOTOR_STBY_PIN);
-    gpio_set_dir(MOTOR_STBY_PIN, GPIO_OUT);
-    gpio_put(MOTOR_STBY_PIN, 1);
-
-    adc_init();
-    adc_gpio_init(SENSOR_ADC_GPIO);
-    adc_select_input(SENSOR_ADC_CHANNEL);
-
-    encoder_sm = pio_claim_unused_sm(encoder_pio, true);
-    uint offset = pio_add_program(encoder_pio, &encoder_period_program);
-    encoder_period_program_init(encoder_pio, encoder_sm, offset, ENCODER_PIN);
-
-    motor_direction = copysignf(1.0f, V_REF);
-
-    next_mark_position = DX_MARK;
-}
 
 
 // ============================================================
@@ -354,7 +318,8 @@ static void shutdown_pico(void)
 {
     // Optional: make the motor controller explicitly safe first.
     gpio_put(MOTOR_STBY_PIN, 0);
-    set_pwm_duty(MOTOR_PWM_PIN, 0.0f);
+    set_pwm_duty(MOTOR_L_PWM_PIN, 0.0f);
+    set_pwm_duty(MOTOR_R_PWM_PIN, 0.0f);
 
     // Enter the lowest-power RP2350 state.
     // at_the_end_of_time is ~300,000 years away.
@@ -375,24 +340,52 @@ static void shutdown_pico(void)
     }
 }
 
+static void hardware_init(void)
+{
+    stdio_init_all();
+
+    cyw43_arch_init();
+    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
+
+    setup_pwm(MOTOR_L_PWM_PIN);
+    setup_pwm(MOTOR_R_PWM_PIN);
+    setup_pwm(SENSOR_PWM_PIN);
+
+    gpio_init(MOTOR_L_DIR_PIN0);
+    gpio_set_dir(MOTOR_L_DIR_PIN0, GPIO_OUT);
+
+    gpio_init(MOTOR_L_DIR_PIN1);
+    gpio_set_dir(MOTOR_L_DIR_PIN1, GPIO_OUT);
+
+    gpio_init(MOTOR_R_DIR_PIN0);
+    gpio_set_dir(MOTOR_R_DIR_PIN0, GPIO_OUT);
+
+    gpio_init(MOTOR_R_DIR_PIN1);
+    gpio_set_dir(MOTOR_R_DIR_PIN1, GPIO_OUT);
+
+    gpio_init(MOTOR_STBY_PIN);
+    gpio_set_dir(MOTOR_STBY_PIN, GPIO_OUT);
+    gpio_put(MOTOR_STBY_PIN, 1);
+
+    adc_init();
+    adc_gpio_init(SENSOR_ADC_GPIO);
+    adc_select_input(SENSOR_ADC_CHANNEL);
+
+    encoder_sm = pio_claim_unused_sm(encoder_pio, true);
+    uint offset = pio_add_program(encoder_pio, &encoder_period_program);
+    encoder_period_program_init(encoder_pio, encoder_sm, offset, ENCODER_PIN);
+
+    motor_direction = copysignf(1.0f, V_REF);
+
+    next_mark_position = DX_MARK;
+}
 
 // ============================================================
 // MAIN
 // ============================================================
 
-int main(void)
+int velocityController(int velocityTarget, bool enableController)
 {
-    hardware_init();
-    printf("\n=====================================\n");
-    printf(" Pico Closed-Loop Controller (RP2350 Optimized)\n");
-    printf("=====================================\n");
-    printf("Ts             = %.6f s\n", TS);
-    printf("Reference      = %.3f m/s\n", V_REF);
-    printf("Encoder marks  = %d\n", ENCODER_MARKS);
-    printf("DX mark        = %.6f m\n", DX_MARK);
-    printf("Deadtime Ticks = %u (%u us)\n", REVERSE_DEAD_TIME_TICKS, REVERSE_DEAD_TIME_TICKS * TS_US);
-    printf("\n");
-
     // 10-second startup delay before starting control loop
     //sleep_ms(1000);
 
@@ -400,7 +393,7 @@ int main(void)
     absolute_time_t next_sample = make_timeout_time_us(TS_US);
     static uint32_t counter = 0;
 
-    while (sample_ticks < 50000)  // Run for 5 seconds at 10 kHz
+    while (enableController)  // Run for 5 seconds at 10 kHz
     {
         gpio_put(MOTOR_STBY_PIN, 1);
         sample_ticks++;
@@ -416,7 +409,7 @@ int main(void)
 
         // 4. Drive Motor PWM
         float duty = fabsf(c);
-        set_pwm_duty(MOTOR_PWM_PIN, duty);
+        set_pwm_duty(MOTOR_L_PWM_PIN, duty);
 
         // 5. Debug Output (Every 50 ms)
         if (++counter >= 500)
