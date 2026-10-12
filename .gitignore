@@ -1,2 +1,5 @@
 build
 !.vscode/*
+!.ancillary/*
+VelocityControl.c
+ancillary/MotorControl.c
