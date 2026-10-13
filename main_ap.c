@@ -4,6 +4,7 @@
 #include "pico/cyw43_arch.h"
 #include "lwip/udp.h"
 #include "motor_control.h"
+#include "pico/critical_section.h"
 
 #define AP_SSID "Pico2W_Net"
 #define AP_PASS "password123"
@@ -19,6 +20,9 @@ typedef enum {
 
 // Must be volatile since it's modified in callbacks and read in interrupts/main loop
 static volatile AppState current_state = STATE_INIT;
+
+critical_section_t motor_crit_sec;
+
 
 // Hardware timer callback for 10 kHz motor loop
 bool motor_timer_callback(struct repeating_timer *t) {
@@ -42,11 +46,15 @@ static void udp_recv_callback(void *arg, struct udp_pcb *pcb, struct pbuf *p,
         
         float vx = 0.0f, vy = 0.0f;
         if (sscanf(buffer, "%f,%f", &vx, &vy) == 2) {
-            motor_set_velocity_reference(vx, vy);
+            enter_critical_section(&motor_crit_sec);
+                motor_set_velocity_reference(vx, vy);
+            exit_critical_section(&motor_crit_sec);
             current_state = STATE_RUNNING; 
         } else if (strncmp(buffer, "STOP", 4) == 0) {
             current_state = STATE_IDLE;
-            motor_set_velocity_reference(0.0f, 0.0f);
+            enter_critical_section(&motor_crit_sec);
+                motor_set_velocity_reference(0.0f, 0.0f);
+            exit_critical_section(&motor_crit_sec);
         }
         
         pbuf_free(p);
@@ -66,8 +74,9 @@ int main() {
     cyw43_arch_enable_ap_mode(AP_SSID, AP_PASS, CYW43_AUTH_WPA2_AES_PSK);
     printf("AP active | SSID: %s | IP: 192.168.4.1\n", AP_SSID);
 
-    // 2. Initialize Motor Hardware
+    // 2. Initialize Motor Hardware & Add Critical Section
     motor_init();
+    critical_section_init(&motor_crit_sec);
 
     // 3. Setup UDP
     struct udp_pcb *pcb = udp_new();
