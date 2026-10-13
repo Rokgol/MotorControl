@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <string.h>
 #include "pico/stdlib.h"
 #include "pico/cyw43_arch.h"
 #include "lwip/udp.h"
@@ -16,7 +17,8 @@ typedef enum {
     STATE_FAULT
 } AppState;
 
-static AppState current_state = STATE_INIT;
+// Must be volatile since it's modified in callbacks and read in interrupts/main loop
+static volatile AppState current_state = STATE_INIT;
 
 // Hardware timer callback for 10 kHz motor loop
 bool motor_timer_callback(struct repeating_timer *t) {
@@ -30,22 +32,21 @@ bool motor_timer_callback(struct repeating_timer *t) {
 static void udp_recv_callback(void *arg, struct udp_pcb *pcb, struct pbuf *p,
                               const ip_addr_t *addr, u16_t port) {
     if (p != NULL) {
-        printf("Received %d bytes from %s:%d -> %.*s\n", 
-               p->len, ipaddr_ntoa(addr), port, p->len, (char *)p->payload);
+        // Safely copy payload to a null-terminated buffer
+        char buffer[64] = {0};
+        u16_t copy_len = p->len < (sizeof(buffer) - 1) ? p->len : (sizeof(buffer) - 1);
+        memcpy(buffer, p->payload, copy_len);
+        buffer[copy_len] = '\0'; 
+
+       // printf("Received %d bytes from %s:%d -> %s\n", p->len, ipaddr_ntoa(addr), port, buffer);
         
-        // Parse UDP payload to extract velocity references (vx, vy)
         float vx = 0.0f, vy = 0.0f;
-        if (sscanf((char *)p->payload, "%f,%f", &vx, &vy) == 2) {
+        if (sscanf(buffer, "%f,%f", &vx, &vy) == 2) {
             motor_set_velocity_reference(vx, vy);
             current_state = STATE_RUNNING; 
-            printf("Set motor reference: vx=%.3f, vy=%.3f\n", vx, vy);
-        } else {
-            // If the command is stop
-            if (p->len >= 4 && strncmp((char*)p->payload, "STOP", 4) == 0) {
-                current_state = STATE_IDLE;
-                motor_set_velocity_reference(0.0f, 0.0f);
-                printf("Motor stopped via UDP command.\n");
-            }
+        } else if (strncmp(buffer, "STOP", 4) == 0) {
+            current_state = STATE_IDLE;
+            motor_set_velocity_reference(0.0f, 0.0f);
         }
         
         pbuf_free(p);
@@ -61,7 +62,7 @@ int main() {
         return 1;
     }
     
-    // Enable Access Point Mode (Default IP is 192.168.4.1)
+    // Enable Access Point Mode
     cyw43_arch_enable_ap_mode(AP_SSID, AP_PASS, CYW43_AUTH_WPA2_AES_PSK);
     printf("AP active | SSID: %s | IP: 192.168.4.1\n", AP_SSID);
 
@@ -87,6 +88,10 @@ int main() {
 
     current_state = STATE_IDLE;
 
+    // Variables for non-blocking LED toggle
+    absolute_time_t next_led_toggle = delayed_by_ms(get_absolute_time(), 500);
+    bool led_state = false;
+
     // 5. General State Machine Loop
     while (true) {
         switch(current_state) {
@@ -94,7 +99,7 @@ int main() {
                 // Wait for commands
                 break;
             case STATE_RUNNING:
-                // Monitor timeouts or faults
+                // Monitor timeouts or faults quickly and efficiently
                 break;
             case STATE_FAULT:
                 motor_shutdown();
@@ -103,11 +108,14 @@ int main() {
                 break;
         }
         
-        // Heartbeat LED
-        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
-        sleep_ms(500);
-        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
-        sleep_ms(500);
+        // Non-blocking Heartbeat LED
+        if (time_reached(next_led_toggle)) {
+            led_state = !led_state;
+            cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, led_state);
+            next_led_toggle = delayed_by_ms(get_absolute_time(), 500);
+        }
+        
+        sleep_ms(1);
     }
     return 0;
 }
