@@ -77,7 +77,7 @@ Commands are ASCII, one command per datagram, at most 63 bytes.
 | `vx,vy`      | Set the velocity reference (floats, m/s) and enter `RUNNING`    |
 | `STOP`       | Short-brake both motors and hold until the next `vx,vy` (`BRAKING`) |
 
-- `vy`: forward/backward speed. Its sign selects the drive direction. The maximum is about 0.66 m/s (`V_MAX`).
+- `vy`: forward/backward speed. Its sign selects the drive direction. The maximum is about 0.44 m/s (`V_MAX`, the measured speed at full duty).
 - `vx`: steering component (positive = right). When it is non-zero, the controller switches to the open-loop turning mode.
 
 **The client must keep sending commands.** If nothing arrives for `CMD_TIMEOUT_MS` (1 s, set in `main_ap.c`), the firmware cuts PWM and lets the motors coast (it does not brake). Resend the current command at about 10–20 Hz. The joystick remote sends at 20 Hz.
@@ -129,7 +129,9 @@ INIT ──► IDLE ◄────── 1 s timeout ──────┐
 
 Entering `IDLE` calls `motor_stop()`, which cuts PWM, coasts the motors and resets the controller. Entering `BRAKING` calls `motor_brake()`, which does the same but short-brakes the motors (IN1 = IN2 = 1). The timeout does not apply in `BRAKING`, so the brake holds until a new velocity command arrives.
 
-UDP packets are handled in two steps. The receive callback runs in the Wi-Fi interrupt and only copies the payload into a one-slot mailbox. The main loop, which runs about every 1 ms, then parses the command and applies it. The status line is also printed from the main loop. As a result, no `printf` or `sscanf` runs inside an interrupt: USB output can block for up to 500 ms, and the C library's float routines are not safe to call from interrupts.
+**`STOP` has priority.** The receive callback runs in the Wi-Fi interrupt and checks every packet for `STOP` first. On a match it brakes immediately, inside the callback, without waiting for the main loop. Braking only writes GPIO/PWM registers, so it is safe in an interrupt. It also throws away any velocity command still waiting in the mailbox, and a stop counter makes sure a command taken from the mailbox before the `STOP` cannot release the brake.
+
+Velocity packets are handled in two steps. The receive callback only copies the payload into a one-slot mailbox. The main loop, which runs about every 1 ms, then parses the command and applies it. The status line is also printed from the main loop. As a result, no `printf` or `sscanf` runs inside an interrupt: USB output can block for up to 500 ms, and the C library's float routines are not safe to call from interrupts.
 
 `motor_control_tick()` runs only in `RUNNING`. State changes and reference updates happen inside a critical section, so they cannot race with the timer interrupt.
 
@@ -152,14 +154,14 @@ outer duty = |v| / V_MAX                  |v| = sqrt(vx² + vy²)
 inner duty = outer duty · |vy| / |v|      1 = straight, 0 = pivot on inner wheel
 ```
 
-The outer wheel is the left one for `vx > 0` and the right one for `vx < 0`. A pure turn (`vy = 0`) pivots forward around the stopped inner wheel. Both motors share one direction setting, so the car cannot spin in place by counter-rotating its wheels. While turning, the PI integral is seeded with `±|v| / V_MAX` (signed by the driving direction), so that switching back to straight driving keeps the wheel speed roughly the same instead of dipping.
+The outer wheel is the left one for `vx > 0` and the right one for `vx < 0`. A pure turn (`vy = 0`) pivots forward around the stopped inner wheel. Both motors share one direction setting, so the car cannot spin in place by counter-rotating its wheels. The turning output equals the PI's feedforward term, and the integral is reset to 0 while turning. Switching back to straight driving therefore starts from the right duty for the new command, with no dip or surge.
 
-PI law (straight mode), sampled at `Ts = 100 µs`:
+PI law with feedforward (straight mode), sampled at `Ts = 100 µs`:
 
 ```
 e  = v_ref − v_meas
-I += α · Ts · e            (clamped to ±1)
-c  = Kp · e + I            (clamped to ±1)
+I += α · Ts · e                     (clamped to ±I_LIMIT)
+c  = v_ref / V_MAX + Kp · e + I     (clamped to ±1)
 
 sign(c) → forward / reverse,   |c| → PWM duty
 ```
@@ -169,8 +171,9 @@ Tunable constants are at the top of [motor_control.c](motor_control.c):
 | Constant                  | Value  | Meaning                               |
 |---------------------------|--------|---------------------------------------|
 | `KP`                      | 1.0    | Proportional gain                     |
-| `ALPHA`                   | 0.625  | Integral gain                         |
-| `V_MAX`                   | 0.663  | Speed at full duty (m/s)              |
+| `ALPHA`                   | 3.0    | Integral gain (Ti = Kp/α ≈ 0.33 s)    |
+| `I_LIMIT`                 | 0.5    | Integral clamp (trims the feedforward)|
+| `V_MAX`                   | 0.44   | Measured speed at full duty (m/s)     |
 | `CONTROL_LIMIT`           | 1.0    | Output saturation                     |
 | `REVERSE_DEAD_TIME_TICKS` | 100    | Brake time before reversal (10 ms)    |
 

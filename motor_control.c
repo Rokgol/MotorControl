@@ -39,7 +39,8 @@ typedef enum {
 #define TS                  0.0001f   // 100 us sample period = 10 kHz
 
 #define KP                  1.0f
-#define ALPHA               0.625f
+#define ALPHA               3.0f      // Integral gain; Ti = KP/ALPHA ~ 0.33 s
+#define I_LIMIT             0.5f      // Integral only trims the feedforward
 
 #define CONTROL_LIMIT       1.0f
 #define V_MAX               0.44f
@@ -195,11 +196,12 @@ static float apply_direction_logic(float c, float dir_ref, uint32_t current_tick
 // PI CONTROLLER (straight driving, closed loop)
 // ============================================================
 static float PI_controller_update(float measured_velocity, float v_ref, uint32_t current_ticks) {
+    float c_ff = v_ref / V_MAX;   // Feedforward operating point duty (same as the free controller)
     float e = v_ref - measured_velocity;
 
     integral_Controller += ALPHA * TS * e;
-    integral_Controller = fmaxf(-CONTROL_LIMIT, fminf(CONTROL_LIMIT, integral_Controller));
-    float c = KP * e + integral_Controller;
+    integral_Controller = fmaxf(-I_LIMIT, fminf(I_LIMIT, integral_Controller));
+    float c = c_ff + KP * e + integral_Controller;
 
     c = fmaxf(-CONTROL_LIMIT, fminf(CONTROL_LIMIT, c));
 
@@ -212,15 +214,14 @@ static float PI_controller_update(float measured_velocity, float v_ref, uint32_t
 // ============================================================
 static float free_controller_update(uint32_t current_ticks){
 
-    float c = KP * v_ref_abs / V_MAX;
+    float c = v_ref_abs / V_MAX;   // Pure feedforward; KP is a feedback gain only
     c = fmaxf(-CONTROL_LIMIT, fminf(CONTROL_LIMIT, c));
 
     // A pure turn (vy == 0) pivots forward around the stopped inner wheel
     float v_dir = (v_ref_y != 0.0f) ? v_ref_y : 1.0f;
 
-    // Seed the PI integral with the signed duty so straight driving resumes smoothly
-    integral_Controller = copysignf(v_ref_abs / V_MAX, v_dir);
-    integral_Controller = fmaxf(-CONTROL_LIMIT, fminf(CONTROL_LIMIT, integral_Controller));
+    // The PI's feedforward picks up from here, so its integral starts fresh
+    integral_Controller = 0.0f;
 
     return apply_direction_logic(c, v_dir, current_ticks);
 }

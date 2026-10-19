@@ -7,11 +7,11 @@
 #include "pico/critical_section.h"
 
 #define AP_SSID "Pico2W_Net"
-#define AP_PASS "RA15612?!"
+#define AP_PASS "RA1562?!"
 #define UDP_PORT 4444
 
 #define CMD_TIMEOUT_MS 1000   // Stop the car if no command arrives for this long
-#define TELEMETRY_INTERVAL_MS 1000
+#define TELEMETRY_INTERVAL_MS 1000     // TEMP 20 for PI tuning; restore to 1000 afterwards
 #define RX_BUF_SIZE 64
 
 // State Machine Enum
@@ -28,11 +28,17 @@ static volatile uint32_t last_cmd_ms = 0;
 
 critical_section_t motor_crit_sec;
 
-// One-slot mailbox: the UDP callback (Wi-Fi IRQ context) only copies the
-// payload here; the main loop parses it. This keeps sscanf/printf out of
-// interrupt context. A newer packet overwrites an unprocessed older one.
+// One-slot mailbox for velocity commands: the UDP callback (Wi-Fi IRQ context)
+// only copies the payload here; the main loop parses it. This keeps sscanf/printf
+// out of interrupt context. A newer packet overwrites an unprocessed older one.
+// STOP never goes through the mailbox, it is handled directly in the callback.
 static char rx_buf[RX_BUF_SIZE];
 static volatile bool rx_pending = false;
+
+// Incremented on every STOP. A velocity command is only applied if no STOP
+// arrived after it was taken from the mailbox, so a stale command can't
+// release the brake.
+static volatile uint32_t stop_count = 0;
 
 
 // Hardware timer callback for 10 kHz motor loop
@@ -51,19 +57,31 @@ static void enter_idle(void) {
     critical_section_exit(&motor_crit_sec);
 }
 
-// Short-brake the motors and hold until the next velocity command
+// Short-brake the motors and hold until the next velocity command.
+// IRQ-safe: only GPIO/PWM register writes, no stdio or heap.
 static void enter_braking(void) {
     critical_section_enter_blocking(&motor_crit_sec);
         current_state = STATE_BRAKING;
         motor_brake();
+        stop_count++;
+        rx_pending = false;   // Drop any velocity command received before the STOP
     critical_section_exit(&motor_crit_sec);
 }
 
-// UDP Receive Callback (runs in Wi-Fi IRQ context: copy only, no parsing)
+// UDP Receive Callback (runs in Wi-Fi IRQ context)
 static void udp_recv_callback(void *arg, struct udp_pcb *pcb, struct pbuf *p,
                               const ip_addr_t *addr, u16_t port) {
     if (p == NULL) return;
 
+    // Braking has priority: check for STOP first and brake right here,
+    // without waiting for the main loop
+    if (p->tot_len >= 4 && pbuf_memcmp(p, 0, "STOP", 4) == 0) {
+        enter_braking();
+        pbuf_free(p);
+        return;
+    }
+
+    // Anything else is copied to the mailbox for the main loop to parse
     critical_section_enter_blocking(&motor_crit_sec);
         u16_t len = pbuf_copy_partial(p, rx_buf, RX_BUF_SIZE - 1, 0);
         rx_buf[len] = '\0';
@@ -73,18 +91,19 @@ static void udp_recv_callback(void *arg, struct udp_pcb *pcb, struct pbuf *p,
     pbuf_free(p);
 }
 
-// Parse and apply a command received over UDP (main loop context)
-static void handle_command(const char *cmd) {
+// Parse and apply a velocity command (main loop context).
+// stop_snapshot is stop_count at the time the command left the mailbox.
+static void handle_command(const char *cmd, uint32_t stop_snapshot) {
     float vx = 0.0f, vy = 0.0f;
-    if (sscanf(cmd, "%f,%f", &vx, &vy) == 2) {
-        critical_section_enter_blocking(&motor_crit_sec);
+    if (sscanf(cmd, "%f,%f", &vx, &vy) != 2) return;
+
+    critical_section_enter_blocking(&motor_crit_sec);
+        if (stop_count == stop_snapshot) {   // No STOP arrived meanwhile
             motor_set_velocity_reference(vx, vy);
             last_cmd_ms = to_ms_since_boot(get_absolute_time());
             current_state = STATE_RUNNING;
-        critical_section_exit(&motor_crit_sec);
-    } else if (strncmp(cmd, "STOP", 4) == 0) {
-        enter_braking();
-    }
+        }
+    critical_section_exit(&motor_crit_sec);
 }
 
 int main() {
@@ -139,14 +158,16 @@ int main() {
 
     // 5. Main Loop
     while (true) {
-        // Handle the latest UDP command, if any
+        // Handle the latest velocity command, if any (STOP is handled in the callback)
         if (rx_pending) {
             char cmd[RX_BUF_SIZE];
+            uint32_t stop_snapshot;
             critical_section_enter_blocking(&motor_crit_sec);
                 memcpy(cmd, rx_buf, sizeof(cmd));
+                stop_snapshot = stop_count;
                 rx_pending = false;
             critical_section_exit(&motor_crit_sec);
-            handle_command(cmd);
+            handle_command(cmd, stop_snapshot);
         }
 
         // Command timeout: stop if the controller goes silent
