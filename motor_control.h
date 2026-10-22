@@ -25,6 +25,9 @@ void motor_stop(void);
 // Same as motor_stop, but short-brakes the motors (IN1 = IN2 = 1) instead of coasting
 void motor_brake(void);
 
+// Cut PWM, coast, and put both drivers in standby (STBY low) before deep sleep
+void motor_shutdown(void);
+
 #ifdef __cplusplus
 }
 #endif

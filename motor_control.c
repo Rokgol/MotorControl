@@ -401,3 +401,8 @@ void motor_brake(void) {
     gpio_put(MOTOR_STBY_PIN, 1);   // Driver must be enabled for short brake
     halt_motors(MODUS_BRAKE);
 }
+
+void motor_shutdown(void) {
+    halt_motors(MODUS_COAST);
+    gpio_put(MOTOR_STBY_PIN, 0);   // Drivers in standby: all outputs high-impedance
+}

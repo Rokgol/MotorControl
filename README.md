@@ -11,10 +11,13 @@ Firmware for a small four-wheeled car built on a **Raspberry Pi Pico 2 W** (RP23
 - **Two control modes:**
   - *Straight driving* (`vx == 0`): closed-loop PI velocity control on encoder feedback.
   - *Turning* (`vx != 0`): open-loop, tank-style differential drive. The outer wheel gets full power and the inner wheel is slowed.
-- **Manual brake.** A `STOP` command short-brakes both motors and holds the brake until the next velocity command.
+- **Manual brake.** A `STOP` command short-brakes all motors and holds the brake until the next velocity command.
+- **Shutdown on long STOP.** Holding `STOP` for 5 s puts the drivers in standby, turns Wi-Fi off and puts the Pico into deep sleep. Only a reset or power cycle brings it back.
 - **Command timeout.** The motors coast to a stop if no command arrives for 1 s.
 - **Direction-reversal protection.** The motors brake and wait through a dead time (10 ms) before they reverse.
 - **Heartbeat LED.** The onboard LED blinks at 1 Hz while the main loop is running.
+-**On Button** A button that pulls low the base of a PNP transistor, allowing power into the Buck module and then into the pico - which turns PIN 9 on and switches on a MOSFET that keep the transistor going.
+- **Off Button** - A button that shorts 3V3_EN and GND to power the pico off.
 
 ## Hardware
 
@@ -89,7 +92,8 @@ Commands are ASCII, one command per datagram, at most 63 bytes.
 | Packet       | Effect                                                          |
 |--------------|-----------------------------------------------------------------|
 | `vx,vy`      | Set the velocity reference (floats, m/s) and enter `RUNNING`    |
-| `STOP`       | Short-brake both motors and hold until the next `vx,vy` (`BRAKING`) |
+| `STOP`       | Short-brake all motors and hold until the next `vx,vy` (`BRAKING`) |
+| `STOP` held 5 s | Deep-sleep shutdown (`SHUTDOWN`): drivers in standby, Wi-Fi off, reset to recover |
 
 - `vy`: forward/backward speed. Its sign selects the drive direction. The maximum is about 0.44 m/s (`V_MAX`, the measured speed at full duty).
 - `vx`: steering component (positive = right). When it is non-zero, the controller switches to the open-loop turning mode.
@@ -138,10 +142,12 @@ INIT ──► IDLE ◄────── 1 s timeout ──────┐
           │                            │
           └────────── "vx,vy" ──► RUNNING ◄──┐
                                        │     │ "vx,vy"
-                                "STOP" └─► BRAKING
+                                "STOP" └─► BRAKING ── "STOP" held 5 s ──► SHUTDOWN (deep sleep)
 ```
 
 Entering `IDLE` calls `motor_stop()`, which cuts PWM, coasts the motors and resets the controller. Entering `BRAKING` calls `motor_brake()`, which does the same but short-brakes the motors (IN1 = IN2 = 1). The timeout does not apply in `BRAKING`, so the brake holds until a new velocity command arrives.
+
+If `STOP` packets keep arriving for `SHUTDOWN_HOLD_MS` (5 s) with no gap longer than `STOP_GAP_MS` (250 ms), the car shuts down. It cancels the control loop, puts both drivers in standby (STBY low), turns Wi-Fi off and enters the RP2350's deepest power state. A gap, or a velocity command, restarts the 5 s count. If the link drops while the car is braking, the brake holds but the car does not shut down. The deep sleep lasts at most about 49 days (`UINT32_MAX` ms), after which the chip reboots normally.
 
 **`STOP` has priority.** The receive callback runs in the Wi-Fi interrupt and checks every packet for `STOP` first. On a match it brakes immediately, inside the callback, without waiting for the main loop. Braking only writes GPIO/PWM registers, so it is safe in an interrupt. It also throws away any velocity command still waiting in the mailbox, and a stop counter makes sure a command taken from the mailbox before the `STOP` cannot release the brake.
 

@@ -61,6 +61,7 @@ target_link_libraries(MotorControl
     hardware_pwm
     hardware_timer
     pico_cyw43_arch_lwip_threadsafe_background
+    pico_low_power
 )
 
 pico_add_extra_outputs(MotorControl)

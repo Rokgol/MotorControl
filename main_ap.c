@@ -5,7 +5,9 @@
 #include "lwip/udp.h"
 #include "motor_control.h"
 #include "pico/critical_section.h"
+#include "pico/low_power.h"
 
+#define ON_PIN 9 //critically keeps the NMOSFET that allows power on
 #define AP_SSID "Pico2W_Net"
 #define AP_PASS "RA1562?!"
 #define UDP_PORT 4444
@@ -14,12 +16,16 @@
 #define TELEMETRY_INTERVAL_MS 1000     // TEMP 20 for PI tuning; restore to 1000 afterwards
 #define RX_BUF_SIZE 64
 
+#define SHUTDOWN_HOLD_MS 5000   // STOP held this long -> deep sleep shutdown
+#define STOP_GAP_MS      250    // A longer gap between STOP packets ends the hold
+
 // State Machine Enum
 typedef enum {
     STATE_INIT,
     STATE_IDLE,
     STATE_RUNNING,
-    STATE_BRAKING
+    STATE_BRAKING,
+    STATE_SHUTDOWN
 } AppState;
 
 // Must be volatile since it's modified in callbacks and read in interrupts/main loop
@@ -39,6 +45,11 @@ static volatile bool rx_pending = false;
 // arrived after it was taken from the mailbox, so a stale command can't
 // release the brake.
 static volatile uint32_t stop_count = 0;
+
+// STOP hold tracking: start of the current uninterrupted run of STOP packets,
+// and the time of the latest one
+static volatile uint32_t stop_hold_start_ms = 0;
+static volatile uint32_t last_stop_ms = 0;
 
 
 // Hardware timer callback for 10 kHz motor loop
@@ -60,7 +71,13 @@ static void enter_idle(void) {
 // Short-brake the motors and hold until the next velocity command.
 // IRQ-safe: only GPIO/PWM register writes, no stdio or heap.
 static void enter_braking(void) {
+    uint32_t now_ms = to_ms_since_boot(get_absolute_time());
     critical_section_enter_blocking(&motor_crit_sec);
+        // A new hold starts if we weren't braking or the STOP packets had a gap
+        if (current_state != STATE_BRAKING || (now_ms - last_stop_ms) > STOP_GAP_MS) {
+            stop_hold_start_ms = now_ms;
+        }
+        last_stop_ms = now_ms;
         current_state = STATE_BRAKING;
         motor_brake();
         stop_count++;
@@ -68,10 +85,41 @@ static void enter_braking(void) {
     critical_section_exit(&motor_crit_sec);
 }
 
+// Shut down after a long STOP hold: drivers to standby, control loop and
+// Wi-Fi off, then deep sleep. Only a reset or power cycle brings the car back.
+static void __attribute__((noreturn)) enter_shutdown(struct udp_pcb *pcb, struct repeating_timer *timer) {
+    critical_section_enter_blocking(&motor_crit_sec);
+        current_state = STATE_SHUTDOWN;
+        motor_shutdown();
+    critical_section_exit(&motor_crit_sec);
+    cancel_repeating_timer(timer);
+
+    printf("STOP held for %d s, shutting down\n", SHUTDOWN_HOLD_MS / 1000);
+    stdio_flush();
+
+    cyw43_arch_lwip_begin();
+    udp_remove(pcb);
+    cyw43_arch_lwip_end();
+    cyw43_arch_deinit();
+
+    // All switchable power domains off. The longest supported sleep is
+    // UINT32_MAX ms (~49 days); after that the chip reboots normally.
+    pstate_bitset_t pstate = pstate_bitset_none();
+    int rc = low_power_pstate_for_ms(UINT32_MAX, &pstate, NULL);
+
+    // Only reached if deep sleep could not be entered: stay halted, drivers off
+    printf("Deep sleep failed (err %d), halting\n", rc);
+    while (true) tight_loop_contents();
+}
+
 // UDP Receive Callback (runs in Wi-Fi IRQ context)
 static void udp_recv_callback(void *arg, struct udp_pcb *pcb, struct pbuf *p,
                               const ip_addr_t *addr, u16_t port) {
     if (p == NULL) return;
+    if (current_state == STATE_SHUTDOWN) {   // Ignore everything while shutting down
+        pbuf_free(p);
+        return;
+    }
 
     // Braking has priority: check for STOP first and brake right here,
     // without waiting for the main loop
@@ -108,7 +156,8 @@ static void handle_command(const char *cmd, uint32_t stop_snapshot) {
 
 int main() {
     stdio_init_all();
-
+    gpio_set_dir(ON_PIN, GPIO_OUT);
+    gpio_put(ON_PIN, true);
     // 1. Initialize Wi-Fi
     if (cyw43_arch_init()) {
         printf("Failed to initialize CYW43\n");
@@ -175,6 +224,13 @@ int main() {
         if (current_state == STATE_RUNNING && (now_ms - last_cmd_ms) > CMD_TIMEOUT_MS) {
             printf("Command timeout, stopping\n");
             enter_idle();
+        }
+
+        // STOP held without interruption for SHUTDOWN_HOLD_MS -> shut down
+        if (current_state == STATE_BRAKING &&
+            (now_ms - last_stop_ms) <= STOP_GAP_MS &&
+            (now_ms - stop_hold_start_ms) >= SHUTDOWN_HOLD_MS) {
+            enter_shutdown(pcb, &timer);
         }
 
         // Telemetry (printed here, never from the 10 kHz ISR)
