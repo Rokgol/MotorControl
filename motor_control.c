@@ -22,16 +22,40 @@ typedef enum {
 // ============================================================
 // PINS
 // ============================================================
-#define MOTOR_L_PWM_PIN     15
-#define MOTOR_R_PWM_PIN     17
+// One PWM and one IN1/IN2 pair per motor (no parallel wiring).
+// All motors use the same truth table; wiring makes IN1=1/IN2=0 drive forward.
+// Left motors on GPIO 0-15, right motors on GPIO 16-28 (IN1, IN2, PWM in a row).
+// Each PWM pin is on its own slice/channel: 15=7B, 12=6A, 21=2B, 27=5B.
 
-#define MOTOR_L_DIR_PIN0    13
-#define MOTOR_L_DIR_PIN1    14
-#define MOTOR_R_DIR_PIN0    11
-#define MOTOR_R_DIR_PIN1    12
+// --- Left side ---
+#define MOTOR_FL_IN1_PIN    13      // Front-left
+#define MOTOR_FL_IN2_PIN    14
+#define MOTOR_FL_PWM_PIN    15
+
+#define MOTOR_RL_IN1_PIN    10      // Rear-left
+#define MOTOR_RL_IN2_PIN    11
+#define MOTOR_RL_PWM_PIN    12
+
+// --- Right side ---
+#define MOTOR_FR_IN1_PIN    19      // Front-right
+#define MOTOR_FR_IN2_PIN    20
+#define MOTOR_FR_PWM_PIN    21
+
+#define MOTOR_RR_IN1_PIN    26      // Rear-right (23-25 are used by the Wi-Fi chip)
+#define MOTOR_RR_IN2_PIN    27
+#define MOTOR_RR_PWM_PIN    22
 
 #define ENCODER_PIN         18
-#define MOTOR_STBY_PIN      16
+#define MOTOR_STBY_PIN      16      // Shared by both drivers
+
+// Compile-time masks so all 8 direction pins are written in one SIO operation
+#define LEFT_IN1_MASK   ((1u << MOTOR_FL_IN1_PIN) | (1u << MOTOR_RL_IN1_PIN))
+#define LEFT_IN2_MASK   ((1u << MOTOR_FL_IN2_PIN) | (1u << MOTOR_RL_IN2_PIN))
+#define RIGHT_IN1_MASK  ((1u << MOTOR_FR_IN1_PIN) | (1u << MOTOR_RR_IN1_PIN))
+#define RIGHT_IN2_MASK  ((1u << MOTOR_FR_IN2_PIN) | (1u << MOTOR_RR_IN2_PIN))
+#define ALL_DIR_MASK    (LEFT_IN1_MASK | LEFT_IN2_MASK | RIGHT_IN1_MASK | RIGHT_IN2_MASK)
+
+enum { SIDE_LEFT = 0, SIDE_RIGHT = 1 };
 
 // ============================================================
 // CONTROL PARAMETERS
@@ -71,6 +95,15 @@ static int motor_direction = 0;
 static int last_active_direction = 1;
 static uint32_t brake_until_ticks = 0;
 static float integral_Controller = 0.0f;
+
+// Common drive modus chosen by apply_direction_logic; applied to the pins
+// once per tick by the output stage
+static MotorModus drive_modus = MODUS_COAST;
+
+// Per-side reversal guard (needed for spin turns, where one side can reverse
+// while drive_modus stays the same)
+static int side_last_dir[2] = {0, 0};
+static uint32_t side_dead_until[2] = {0, 0};
 
 static PIO encoder_pio = pio1;
 static int encoder_sm = -1;
@@ -133,24 +166,58 @@ static void set_pwm_duty(uint gpio, float duty) {
 // ============================================================
 // DIRECTION PINS
 // ============================================================
-// Drives IN1/IN2 of both H-bridge channels:
+// Truth table, identical for every motor:
 //   FORWARD = 1/0, REVERSE = 0/1, COAST = 0/0, BRAKE = 1/1
-static void set_motor_modus(MotorModus m) {
-    bool in1 = (m == MODUS_FORWARD || m == MODUS_BRAKE);
-    bool in2 = (m == MODUS_REVERSE || m == MODUS_BRAKE);
+static inline uint32_t modus_bits(MotorModus m, uint32_t in1_mask, uint32_t in2_mask) {
+    uint32_t bits = 0;
+    if (m == MODUS_FORWARD || m == MODUS_BRAKE) bits |= in1_mask;
+    if (m == MODUS_REVERSE || m == MODUS_BRAKE) bits |= in2_mask;
+    return bits;
+}
 
-    gpio_put(MOTOR_L_DIR_PIN0, in1);
-    gpio_put(MOTOR_L_DIR_PIN1, in2);
-    gpio_put(MOTOR_R_DIR_PIN0, in2);    //Direction flipped in physical motor connection,
-    gpio_put(MOTOR_R_DIR_PIN1, in1);    //So this is way easier to fix in code.
+// Sets IN1/IN2 of all four motors in a single register write, so every
+// pin switches in the same cycle
+static void set_motor_modus(MotorModus left, MotorModus right) {
+    uint32_t value = modus_bits(left,  LEFT_IN1_MASK,  LEFT_IN2_MASK)
+                   | modus_bits(right, RIGHT_IN1_MASK, RIGHT_IN2_MASK);
+    gpio_put_masked(ALL_DIR_MASK, value);
+}
+
+static inline MotorModus opposite_modus(MotorModus m) {
+    if (m == MODUS_FORWARD) return MODUS_REVERSE;
+    if (m == MODUS_REVERSE) return MODUS_FORWARD;
+    return m;   // COAST and BRAKE are never flipped
+}
+
+// Coasts a side for REVERSE_DEAD_TIME_TICKS when it would flip directly
+// between FORWARD and REVERSE. BRAKE and COAST pass through unchanged.
+static MotorModus guard_side(int side, MotorModus m, float *duty, uint32_t current_ticks) {
+    if (m != MODUS_FORWARD && m != MODUS_REVERSE) {
+        side_last_dir[side] = 0;
+        return m;
+    }
+
+    int dir = (m == MODUS_FORWARD) ? +1 : -1;
+    if (current_ticks < side_dead_until[side]) {
+        *duty = 0.0f;
+        return MODUS_COAST;
+    }
+    if (side_last_dir[side] != 0 && dir != side_last_dir[side]) {
+        side_last_dir[side] = dir;
+        side_dead_until[side] = current_ticks + REVERSE_DEAD_TIME_TICKS;
+        *duty = 0.0f;
+        return MODUS_COAST;
+    }
+    side_last_dir[side] = dir;
+    return m;
 }
 
 // ============================================================
 // DIRECTION LOGIC (shared by both controllers)
 // ============================================================
 // Brakes on a hard sign change of the control output, inserts a dead time
-// before reversing, and sets the direction pins from the sign of dir_ref.
-// Returns the (possibly zeroed) control output.
+// before reversing, and picks drive_modus from the sign of dir_ref (the pins
+// are written later by the output stage). Returns the (possibly zeroed) output.
 static float apply_direction_logic(float c, float dir_ref, uint32_t current_ticks) {
     int requested_direction = 0;
     if (dir_ref > 0.0f)
@@ -159,7 +226,7 @@ static float apply_direction_logic(float c, float dir_ref, uint32_t current_tick
         requested_direction = -1;
 
     if (fabsf(c) >= CONTROL_LIMIT / 2.0f && copysignf(1.0f, c) != copysignf(1.0f, c_previous)) {
-        set_motor_modus(MODUS_BRAKE);
+        drive_modus = MODUS_BRAKE;
         c_previous = c;
         return c;
     }
@@ -182,11 +249,11 @@ static float apply_direction_logic(float c, float dir_ref, uint32_t current_tick
     }
 
     if (motor_direction > 0)
-        set_motor_modus(MODUS_FORWARD);
+        drive_modus = MODUS_FORWARD;
     else if (motor_direction < 0)
-        set_motor_modus(MODUS_REVERSE);
+        drive_modus = MODUS_REVERSE;
     else
-        set_motor_modus(MODUS_COAST);
+        drive_modus = MODUS_COAST;
 
     c_previous = c;
     return c;
@@ -217,7 +284,7 @@ static float free_controller_update(uint32_t current_ticks){
     float c = v_ref_abs / V_MAX;   // Pure feedforward; KP is a feedback gain only
     c = fmaxf(-CONTROL_LIMIT, fminf(CONTROL_LIMIT, c));
 
-    // A pure turn (vy == 0) pivots forward around the stopped inner wheel
+    // A pure turn (vy == 0) counts as forward; the output stage spins it in place
     float v_dir = (v_ref_y != 0.0f) ? v_ref_y : 1.0f;
 
     // The PI's feedforward picks up from here, so its integral starts fresh
@@ -232,18 +299,15 @@ static float free_controller_update(uint32_t current_ticks){
 // ============================================================
 
 void motor_init(void) {
-    setup_pwm(MOTOR_L_PWM_PIN);
-    setup_pwm(MOTOR_R_PWM_PIN);
+    setup_pwm(MOTOR_FL_PWM_PIN);
+    setup_pwm(MOTOR_RL_PWM_PIN);
+    setup_pwm(MOTOR_FR_PWM_PIN);
+    setup_pwm(MOTOR_RR_PWM_PIN);
 
-    const uint out_pins[] = {
-        MOTOR_L_DIR_PIN0, MOTOR_L_DIR_PIN1,
-        MOTOR_R_DIR_PIN0, MOTOR_R_DIR_PIN1,
-        MOTOR_STBY_PIN
-    };
-    for (uint i = 0; i < count_of(out_pins); i++) {
-        gpio_init(out_pins[i]);
-        gpio_set_dir(out_pins[i], GPIO_OUT);
-    }
+    const uint32_t out_mask = ALL_DIR_MASK | (1u << MOTOR_STBY_PIN);
+    gpio_init_mask(out_mask);
+    gpio_set_dir_out_masked(out_mask);
+    set_motor_modus(MODUS_COAST, MODUS_COAST);
     gpio_put(MOTOR_STBY_PIN, 1);
 
     encoder_sm = pio_claim_unused_sm(encoder_pio, true);
@@ -264,24 +328,38 @@ void motor_control_tick(void) {
     float measured_v = read_pio_encoder_velocity(sample_ticks);
     float c_left = 0.0f;
     float c_right = 0.0f;
+    MotorModus left_modus, right_modus;
+
     if(v_ref_x == 0){
         c_left = PI_controller_update(measured_v, v_ref_y, sample_ticks);
         c_right = c_left;
+        left_modus = right_modus = drive_modus;
     }
     else{
+        bool spin = (v_ref_y == 0.0f);   // Pure turn: sides counter-rotate in place
         // Inner wheel runs at the forward share of the command: 1 = straight, 0 = pivot
-        float k = fabsf(v_ref_y) / (v_ref_abs > 0.001f ? v_ref_abs : 1.0f);
+        float k = spin ? 1.0f : fabsf(v_ref_y) / (v_ref_abs > 0.001f ? v_ref_abs : 1.0f);
         if (v_ref_x > 0) {
             c_left = free_controller_update(sample_ticks);
             c_right = c_left * k;
+            left_modus = drive_modus;
+            right_modus = spin ? opposite_modus(drive_modus) : drive_modus;
         } else {
             c_right = free_controller_update(sample_ticks);
             c_left = c_right * k;
+            right_modus = drive_modus;
+            left_modus = spin ? opposite_modus(drive_modus) : drive_modus;
         }
     }
 
-    set_pwm_duty(MOTOR_L_PWM_PIN, c_left);
-    set_pwm_duty(MOTOR_R_PWM_PIN, c_right);
+    left_modus  = guard_side(SIDE_LEFT,  left_modus,  &c_left,  sample_ticks);
+    right_modus = guard_side(SIDE_RIGHT, right_modus, &c_right, sample_ticks);
+
+    set_pwm_duty(MOTOR_FL_PWM_PIN, c_left);
+    set_pwm_duty(MOTOR_RL_PWM_PIN, c_left);
+    set_pwm_duty(MOTOR_FR_PWM_PIN, c_right);
+    set_pwm_duty(MOTOR_RR_PWM_PIN, c_right);
+    set_motor_modus(left_modus, right_modus);
 
     telem_v = measured_v;
     telem_c_left = c_left;
@@ -300,10 +378,15 @@ static void halt_motors(MotorModus m) {
     integral_Controller = 0.0f;
     c_previous = 0.0f;
     motor_direction = 0;
+    drive_modus = m;
+    side_last_dir[SIDE_LEFT] = side_last_dir[SIDE_RIGHT] = 0;
+    side_dead_until[SIDE_LEFT] = side_dead_until[SIDE_RIGHT] = 0;
 
-    set_pwm_duty(MOTOR_L_PWM_PIN, 0.0f);
-    set_pwm_duty(MOTOR_R_PWM_PIN, 0.0f);
-    set_motor_modus(m);
+    set_pwm_duty(MOTOR_FL_PWM_PIN, 0.0f);
+    set_pwm_duty(MOTOR_RL_PWM_PIN, 0.0f);
+    set_pwm_duty(MOTOR_FR_PWM_PIN, 0.0f);
+    set_pwm_duty(MOTOR_RR_PWM_PIN, 0.0f);
+    set_motor_modus(m, m);   // BRAKE = 1/1 on all 8 IN pins, COAST = 0/0
 }
 
 //=================================================================================

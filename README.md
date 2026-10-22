@@ -18,18 +18,32 @@ Firmware for a small four-wheeled car built on a **Raspberry Pi Pico 2 W** (RP23
 
 ## Hardware
 
+Each motor has its own PWM pin and IN1/IN2 pair (no parallel wiring). Left motors use GPIO 0–15 and right motors use GPIO 16–28, with each motor on three pins in a row (IN1, IN2, PWM):
+
+| Side  | Motor            | IN1 | IN2 | PWM (slice) |
+|-------|------------------|-----|-----|-------------|
+| Left  | Front-left (FL)  | 13  | 14  | 15 (7B)     |
+| Left  | Rear-left (RL)   | 10  | 11  | 12 (6A)     |
+| Right | Front-right (FR) | 19  | 20  | 21 (2B)     |
+| Right | Rear-right (RR)  | 26  | 27  | 22 (3A)     |
+
+Toshiba TB6612FNG H-Bridge has AIN2 | AIN1 | STBY | BIN1 | BIN2,
+essentially expecting opposite motor directions due to layout symmetry.
+Since we also have layout anti-symmetry, this should work well for us, so we will connect IN1|IN2 -> AIN2|AIN1 -> + - which should parallel
+IN1|IN2 -> BIN1|BIN2 -> - +.
+
+GPIO 23–25 belong to the Wi-Fi chip, so RR uses 22 for PWM and 26/27 for IN1/IN2. Every PWM pin is on a different PWM slice/channel, so all four motors' duty cycles can be set independently.
+
 | Function                | GPIO | Notes                                  |
 |-------------------------|------|----------------------------------------|
-| Left motor PWM          | 15   |                                        |
-| Left motor IN1 / IN2    | 13 / 14 |                                     |
-| Right motor PWM         | 17   |                                        |
-| Right motor IN1 / IN2   | 11 / 12 |                                     |
-| Driver standby (STBY)   | 16   | High = driver enabled                  |
+| Driver standby (STBY)   | 16   | Shared by both drivers. High = enabled |
 | Wheel encoder           | 18   | Input with pull-up, read by PIO1       |
+
+All 8 direction pins are written with a single register write (`gpio_put_masked`), so every motor switches in the same cycle.
 
 The pin scheme (IN1/IN2/PWM per channel plus STBY) matches a **TB6612FNG**-style dual H-bridge.
 
-Direction truth table (applied to both motors):
+Direction truth table, identical for every motor. There are no software inversions: wire each motor so that IN1 = 1, IN2 = 0 drives its wheel forward. If a wheel runs backwards, swap its motor leads.
 
 | IN1 | IN2 | Mode    |
 |-----|-----|---------|
@@ -151,10 +165,10 @@ Turning mode (tank-style, no steering axle):
 
 ```
 outer duty = |v| / V_MAX                  |v| = sqrt(vx² + vy²)
-inner duty = outer duty · |vy| / |v|      1 = straight, 0 = pivot on inner wheel
+inner duty = outer duty · |vy| / |v|      1 = straight, 0 = pivot on inner wheel (vy = 0: spin, see below)
 ```
 
-The outer wheel is the left one for `vx > 0` and the right one for `vx < 0`. A pure turn (`vy = 0`) pivots forward around the stopped inner wheel. Both motors share one direction setting, so the car cannot spin in place by counter-rotating its wheels. The turning output equals the PI's feedforward term, and the integral is reset to 0 while turning. Switching back to straight driving therefore starts from the right duty for the new command, with no dip or surge.
+The outer wheel is the left one for `vx > 0` and the right one for `vx < 0`. A pure turn (`vy = 0`) spins the car in place: both sides run at `|vx| / V_MAX`, with the inner side in reverse. If one side would flip directly between forward and reverse (for example arc → spin, or spin left → spin right), that side first coasts for 10 ms (`REVERSE_DEAD_TIME_TICKS`). The turning output equals the PI's feedforward term, and the integral is reset to 0 while turning. Switching back to straight driving therefore starts from the right duty for the new command, with no dip or surge.
 
 PI law with feedforward (straight mode), sampled at `Ts = 100 µs`:
 
